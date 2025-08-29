@@ -35,3 +35,4 @@ node_modules
 !/soundpacks/mouse/ping/
 !/soundpacks/mouse/vibrate/
 !/soundpacks/mouse/wooden/
+Cargo.lock

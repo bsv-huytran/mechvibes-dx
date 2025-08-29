@@ -1,10 +1,23 @@
+use image::GenericImageView;
 use tray_icon::{
-    Icon,
+    Icon, 
     menu::{ Menu, MenuEvent, MenuItem, PredefinedMenuItem, MenuId },
-    TrayIcon,
+    TrayIcon, 
     TrayIconBuilder,
 };
 use crate::utils::constants::APP_NAME;
+
+// Embed tray icon at compile time to avoid fragile runtime paths
+// Using a crate-root-absolute path makes this independent of current working directory.
+const ICON_BYTES: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/icon.ico"));
+
+fn load_tray_icon() -> tray_icon::Icon {
+    // Decode embedded ICO (or PNG) and build RGBA icon for tray_icon.
+    let img = image::load_from_memory(ICON_BYTES).expect("embedded icon decode failed");
+    let (w, h) = img.dimensions();
+    let rgba = img.to_rgba8().into_raw();
+    tray_icon::Icon::from_rgba(rgba, w as u32, h as u32).expect("Icon::from_rgba failed")
+}
 
 pub enum TrayMessage {
     Show,
@@ -71,8 +84,8 @@ impl TrayManager {
             ]
         )?;
 
-        // Load the icon from the specified path
-        let icon = Icon::from_path("assets/icon.ico", Some((32, 32))).expect("Failed to load icon");
+        // Load the icon from the specified path (works on macOS & Windows, no runtime I/O)
+        let icon = load_tray_icon();
 
         // Build the tray icon
         let tray_icon = TrayIconBuilder::new()
