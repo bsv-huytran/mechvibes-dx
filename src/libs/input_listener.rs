@@ -378,7 +378,21 @@ mod macos_impl {
     use std::collections::HashSet;
     use std::sync::{mpsc::Sender, Arc, Mutex};
     use std::thread;
-    use std::time::{Duration, Instant};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+    use std::sync::OnceLock; // NEW: for storing tap port
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    // --- NEW: FFI to re-enable CGEventTap ---
+    #[link(name = "ApplicationServices", kind = "framework")]
+    unsafe extern "C" {
+        fn CGEventTapEnable(tap: core_foundation::mach_port::CFMachPortRef, enable: bool);
+        fn CGEventTapIsEnabled(tap: core_foundation::mach_port::CFMachPortRef) -> bool;
+    }
+
+    // Global slot to hold the pointer value (as usize) — usize is Sync.
+    static TAP_PORT_RAW: OnceLock<usize> = OnceLock::new();
+    static LAST_EVENT_NS: AtomicU64 = AtomicU64::new(0);
+    static LAST_REPAIR_NS: AtomicU64 = AtomicU64::new(0);
 
     // Quartz CGEventField numeric constants (stable across crate versions)
     const KCG_KEYBOARD_EVENT_KEYCODE: CGEventField = 9;
@@ -489,6 +503,16 @@ mod macos_impl {
             let data_for_cb = std::sync::Arc::clone(&data);
 
             let cb = move |_proxy: CGEventTapProxy, etype: CGEventType, event: &CGEvent| -> CallbackResult {
+                // NEW: if the event tap got disabled, immediately re-enable and skip further handling
+                if matches!(etype, CGEventType::TapDisabledByTimeout | CGEventType::TapDisabledByUserInput) {
+                    if let Some(raw) = TAP_PORT_RAW.get() {
+                        let p = *raw as core_foundation::mach_port::CFMachPortRef;
+                        unsafe { CGEventTapEnable(p, true); }
+                    }
+                    LAST_EVENT_NS.store(SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64, Ordering::Relaxed);
+                    return CallbackResult::Keep;
+                }
+
                 // We do NOT mutate the captured variable itself, so the closure is Fn
                 let d: &CallbackData = &data_for_cb;
 
@@ -506,7 +530,7 @@ mod macos_impl {
                             } else if matches!(code, "AltLeft" | "AltRight") {
                                 *alt = matches!(etype, CGEventType::KeyDown);
                             } else if code == "KeyM" && matches!(etype, CGEventType::KeyDown) && *ctrl && *alt {
-                                let _ = d.hotkey_tx.send("TOGGLE_SOUND".to_string());
+                                let _ = d.hotkey_tx.send("TOGGLE_SOUND".to_string());                    
                                 return CallbackResult::Keep; // pass through
                             }
                         }
@@ -536,6 +560,7 @@ mod macos_impl {
                             let _ = d.keyboard_tx.send(format!("UP:{}", code));
                         }
                     }
+                    LAST_EVENT_NS.store(SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64, Ordering::Relaxed);
                     return CallbackResult::Keep;
                 }
 
@@ -585,6 +610,7 @@ mod macos_impl {
                             let _ = d.mouse_tx.send(format!("UP:{}", btn_code));
                         }
                     }
+                    LAST_EVENT_NS.store(SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64, Ordering::Relaxed);
                     return CallbackResult::Keep;
                 }
 
@@ -595,7 +621,7 @@ mod macos_impl {
             let tap = CGEventTap::new(
                 CGEventTapLocation::HID,
                 CGEventTapPlacement::HeadInsertEventTap,
-                CGEventTapOptions::Default,
+                CGEventTapOptions::Default, // NEW: safer, we only listen
                 events,
                 cb,
             )
@@ -604,13 +630,42 @@ mod macos_impl {
             unsafe {
                 // Add to runloop
                 let port: &CFMachPort = tap.mach_port(); // core-foundation 0.10 type
+                let port_ref = port.as_concrete_TypeRef();
+                // store as usize to avoid Send/Sync bounds on raw pointers
+                let _ = TAP_PORT_RAW.set(port_ref as usize);
+
                 let source = CFMachPortCreateRunLoopSource(
                     kCFAllocatorDefault,
-                    port.as_concrete_TypeRef(),
+                    port_ref,
                     0,
                 );
                 let rl = CFRunLoopGetCurrent();
                 CFRunLoopAddSource(rl, source, kCFRunLoopCommonModes);
+        
+                std::thread::spawn(|| {
+                    loop {
+                        std::thread::sleep(Duration::from_secs(2));
+                        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64;
+                        let last = LAST_EVENT_NS.load(Ordering::Relaxed);
+                        // If no events for 5s, and tap is disabled, re-enable it
+                        if last != 0 && now.saturating_sub(last) > 5_000_000_000 {
+                            if let Some(raw) = TAP_PORT_RAW.get() {
+                                let p = *raw as core_foundation::mach_port::CFMachPortRef;
+                                // Check if tap is enabled
+                                let is_enabled = unsafe { CGEventTapIsEnabled(p) };
+                                if !is_enabled {
+                                    // Throttle: only re-enable once every 10s
+                                    let since_fix = now.saturating_sub(LAST_REPAIR_NS.load(Ordering::Relaxed));
+                                    if since_fix > 10_000_000_000 {
+                                        unsafe { CGEventTapEnable(p, true); }
+                                        LAST_REPAIR_NS.store(now, Ordering::Relaxed);
+                                        println!("🩹 Watchdog re-enabled CGEventTap");
+                                    }
+                                }
+                            }
+                        }
+                    }
+                });
                 println!("✅ CGEventTap installed (check System Settings > Privacy & Security)");
                 CFRunLoopRun();
             }
