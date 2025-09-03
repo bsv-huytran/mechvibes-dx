@@ -379,6 +379,16 @@ mod macos_impl {
     use std::sync::{mpsc::Sender, Arc, Mutex};
     use std::thread;
     use std::time::{Duration, Instant};
+    use std::sync::OnceLock; // NEW: for storing tap port
+
+    // --- NEW: FFI to re-enable CGEventTap ---
+    #[link(name = "ApplicationServices", kind = "framework")]
+    unsafe extern "C" {
+        fn CGEventTapEnable(tap: core_foundation::mach_port::CFMachPortRef, enable: bool);
+    }
+
+    // NEW: Global slot to hold the pointer value (as usize) — usize is Sync.
+    static TAP_PORT_RAW: OnceLock<usize> = OnceLock::new();
 
     // Quartz CGEventField numeric constants (stable across crate versions)
     const KCG_KEYBOARD_EVENT_KEYCODE: CGEventField = 9;
@@ -483,12 +493,24 @@ mod macos_impl {
                 CGEventType::RightMouseUp,
                 CGEventType::OtherMouseDown,
                 CGEventType::OtherMouseUp,
+                // NEW: watch for tap being disabled by system
+                CGEventType::TapDisabledByTimeout,
+                CGEventType::TapDisabledByUserInput,
             ];
 
             // FIX: capture an Arc and use it immutably; mutate through Mutex inside fields
             let data_for_cb = std::sync::Arc::clone(&data);
 
             let cb = move |_proxy: CGEventTapProxy, etype: CGEventType, event: &CGEvent| -> CallbackResult {
+                // NEW: if the event tap got disabled, immediately re-enable and skip further handling
+                if matches!(etype, CGEventType::TapDisabledByTimeout | CGEventType::TapDisabledByUserInput) {
+                    if let Some(raw) = TAP_PORT_RAW.get() {
+                        let p = *raw as core_foundation::mach_port::CFMachPortRef;
+                        unsafe { CGEventTapEnable(p, true); }
+                    }
+                    return CallbackResult::Keep;
+                }
+
                 // We do NOT mutate the captured variable itself, so the closure is Fn
                 let d: &CallbackData = &data_for_cb;
 
@@ -595,7 +617,7 @@ mod macos_impl {
             let tap = CGEventTap::new(
                 CGEventTapLocation::HID,
                 CGEventTapPlacement::HeadInsertEventTap,
-                CGEventTapOptions::Default,
+                CGEventTapOptions::ListenOnly, // NEW: safer, we only listen
                 events,
                 cb,
             )
@@ -604,9 +626,13 @@ mod macos_impl {
             unsafe {
                 // Add to runloop
                 let port: &CFMachPort = tap.mach_port(); // core-foundation 0.10 type
+                let port_ref = port.as_concrete_TypeRef();
+                // store as usize to avoid Send/Sync bounds on raw pointers
+                let _ = TAP_PORT_RAW.set(port_ref as usize);
+
                 let source = CFMachPortCreateRunLoopSource(
                     kCFAllocatorDefault,
-                    port.as_concrete_TypeRef(),
+                    port_ref,
                     0,
                 );
                 let rl = CFRunLoopGetCurrent();
