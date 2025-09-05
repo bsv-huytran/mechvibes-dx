@@ -362,7 +362,6 @@ pub use non_macos_impl::start_unified_input_listener;
 // ==============================
 #[cfg(target_os = "macos")]
 mod macos_impl {
-    use super::*;
 
     use core_foundation::base::{kCFAllocatorDefault, TCFType};
     use core_foundation::mach_port::{CFMachPort, CFMachPortCreateRunLoopSource};
@@ -372,27 +371,52 @@ mod macos_impl {
 
     use core_graphics::event::{
         CallbackResult, CGEvent, CGEventField, CGEventTap, CGEventTapLocation,
-        CGEventTapOptions, CGEventTapPlacement, CGEventTapProxy, CGEventType,
+        CGEventTapOptions, CGEventTapPlacement, CGEventTapProxy, CGEventType, CGEventFlags
     };
 
     use std::collections::HashSet;
     use std::sync::{mpsc::Sender, Arc, Mutex};
     use std::thread;
-    use std::time::{Duration, Instant};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
     use std::sync::OnceLock; // NEW: for storing tap port
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use objc::{class, msg_send, sel, sel_impl};
+    use objc::runtime::Object;
 
     // --- NEW: FFI to re-enable CGEventTap ---
     #[link(name = "ApplicationServices", kind = "framework")]
     unsafe extern "C" {
         fn CGEventTapEnable(tap: core_foundation::mach_port::CFMachPortRef, enable: bool);
+        fn CGEventTapIsEnabled(tap: core_foundation::mach_port::CFMachPortRef) -> bool;
     }
 
-    // NEW: Global slot to hold the pointer value (as usize) — usize is Sync.
+    // Global slot to hold the pointer value (as usize) — usize is Sync.
     static TAP_PORT_RAW: OnceLock<usize> = OnceLock::new();
+    static LAST_EVENT_NS: AtomicU64 = AtomicU64::new(0);
+    static LAST_REPAIR_NS: AtomicU64 = AtomicU64::new(0);
 
     // Quartz CGEventField numeric constants (stable across crate versions)
     const KCG_KEYBOARD_EVENT_KEYCODE: CGEventField = 9;
     const KCG_MOUSE_EVENT_BUTTON_NUMBER: CGEventField = 11;
+    // Long idle will consider state as “suspicious” and clean it up to avoid key jamming
+    const STALE_CLEAR_MS: u64 = 1200;
+
+    // Keep the activity token so the OS knows we are still "busy" (no App Nap)
+    static ACTIVITY_TOKEN: OnceLock<usize> = OnceLock::new();
+
+    #[inline]
+    fn begin_no_nap_activity() {
+        // Keep process "awake" while listening for input, no background noise needed
+        // Use NSProcessInfo beginActivityWithOptions:reason:
+        // Use only lightweight flag: NSActivityIdleSystemSleepDisabled = 1 << 20
+        unsafe {
+            let pi: *mut Object = msg_send![class!(NSProcessInfo), processInfo];
+            let opts: u64 = 1u64 << 20; // NSActivityIdleSystemSleepDisabled
+            let reason: *mut Object = core::ptr::null_mut(); // nil
+            let token: *mut Object = msg_send![pi, beginActivityWithOptions: opts reason: reason];
+            let _ = ACTIVITY_TOKEN.set(token as usize);
+        }
+    }
 
     fn map_macos_keycode_to_code(kc: u16) -> &'static str {
         match kc {
@@ -487,6 +511,7 @@ mod macos_impl {
             let events = vec![
                 CGEventType::KeyDown,
                 CGEventType::KeyUp,
+                CGEventType::FlagsChanged,
                 CGEventType::LeftMouseDown,
                 CGEventType::LeftMouseUp,
                 CGEventType::RightMouseDown,
@@ -508,6 +533,7 @@ mod macos_impl {
                         let p = *raw as core_foundation::mach_port::CFMachPortRef;
                         unsafe { CGEventTapEnable(p, true); }
                     }
+                    LAST_EVENT_NS.store(SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64, Ordering::Relaxed);
                     return CallbackResult::Keep;
                 }
 
@@ -516,6 +542,21 @@ mod macos_impl {
 
                 // ===== Keyboard =====
                 if matches!(etype, CGEventType::KeyDown | CGEventType::KeyUp) {
+                    // CLEAN STATE AFTER IDLE: update milestone & clear if idle exceeds threshold
+                    let now = Instant::now();
+                    let idle_and_update = {
+                        let mut last = d.keyboard_last_press.lock().unwrap();
+                        let idle = now.duration_since(*last);
+                        // Clear stuck state if idle exceeds threshold
+                        if idle > Duration::from_millis(STALE_CLEAR_MS) {
+                            d.pressed_keys.lock().unwrap().clear();
+                            d.pressed_buttons.lock().unwrap().clear();
+                        }
+                        // ONLY update after idle calculation
+                        *last = now;
+                        idle
+                    };
+
                     let kc = event.get_integer_value_field(KCG_KEYBOARD_EVENT_KEYCODE) as u16;
                     let code = map_macos_keycode_to_code(kc);
                     if !code.is_empty() {
@@ -528,7 +569,7 @@ mod macos_impl {
                             } else if matches!(code, "AltLeft" | "AltRight") {
                                 *alt = matches!(etype, CGEventType::KeyDown);
                             } else if code == "KeyM" && matches!(etype, CGEventType::KeyDown) && *ctrl && *alt {
-                                let _ = d.hotkey_tx.send("TOGGLE_SOUND".to_string());
+                                let _ = d.hotkey_tx.send("TOGGLE_SOUND".to_string());                    
                                 return CallbackResult::Keep; // pass through
                             }
                         }
@@ -541,14 +582,12 @@ mod macos_impl {
                             pressed.insert(code.to_string());
                             drop(pressed);
 
-                            let now = Instant::now();
-                            let mut last = d.keyboard_last_press.lock().unwrap();
-                            let dt = now.duration_since(*last);
+                            let dt = idle_and_update;
+
                             if code == "Backspace" && dt < Duration::from_millis(10) {
                                 return CallbackResult::Keep;
                             }
                             if dt > Duration::from_millis(1) {
-                                *last = now;
                                 let _ = d.keyboard_tx.send(code.to_string());
                             }
                         } else {
@@ -558,6 +597,72 @@ mod macos_impl {
                             let _ = d.keyboard_tx.send(format!("UP:{}", code));
                         }
                     }
+                    LAST_EVENT_NS.store(SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64, Ordering::Relaxed);
+                    return CallbackResult::Keep;
+                }
+
+                // ===== Modifier (flags changed) =====
+                if matches!(etype, CGEventType::FlagsChanged) {
+                    // CLEAN STATE AFTER IDLE (modifier is also keyboard event)
+                    let now = Instant::now();
+                    let idle_and_update = {
+                        let mut last = d.mouse_last_press.lock().unwrap();
+                        let idle = now.duration_since(*last);
+                        if idle > Duration::from_millis(STALE_CLEAR_MS) {
+                            d.pressed_keys.lock().unwrap().clear();
+                            d.pressed_buttons.lock().unwrap().clear();
+                        }
+                        *last = now;
+                        idle
+                    };               
+                    // 1) Read flags (core-graphics 0.25 uses get_flags())
+                    let flags: CGEventFlags = event.get_flags();
+                    let ctrl_down  = flags.contains(CGEventFlags::CGEventFlagControl);
+                    let alt_down   = flags.contains(CGEventFlags::CGEventFlagAlternate);
+                    let cmd_down   = flags.contains(CGEventFlags::CGEventFlagCommand);
+                    let shift_down = flags.contains(CGEventFlags::CGEventFlagShift);
+                    // let caps_on    = flags.contains(CGEventFlags::CGEventFlagAlphaShift);
+
+                    // Keep hotkey state in sync (your Ctrl+Alt+M)
+                    { *data_for_cb.ctrl_pressed.lock().unwrap() = ctrl_down; }
+                    { *data_for_cb.alt_pressed.lock().unwrap()  = alt_down; }
+
+                    // 2) Figure out WHICH modifier key changed from the keycode
+                    let kc = event.get_integer_value_field(KCG_KEYBOARD_EVENT_KEYCODE) as u16;
+                    let code = map_macos_keycode_to_code(kc);
+                    if !code.is_empty() {
+                        // For that specific code, compute "down?" from flags
+                        let is_down = match code {
+                            "ControlLeft" | "ControlRight" => ctrl_down,
+                            "AltLeft"     | "AltRight"     => alt_down,
+                            "MetaLeft"    | "MetaRight"    => cmd_down,
+                            "ShiftLeft"   | "ShiftRight"   => shift_down,
+                            // "CapsLock"                         => caps_on, // toggle key
+                            _ => false,
+                        };
+
+                        // 3) Emit synthetic KeyDown/KeyUp to your pipeline (with de-dup)
+                        if is_down {
+                            let mut pressed = d.pressed_keys.lock().unwrap();
+                            if !pressed.contains(code) {
+                                pressed.insert(code.to_string());
+                                drop(pressed);
+                                let _ = d.keyboard_tx.send(code.to_string());           // KeyDown
+                            }
+                        } else {
+                            let mut pressed = d.pressed_keys.lock().unwrap();
+                            if pressed.remove(code) {
+                                drop(pressed);
+                                let _ = d.keyboard_tx.send(format!("UP:{}", code));    // KeyUp
+                            }
+                        }
+                    }
+
+                    // Heartbeat
+                    LAST_EVENT_NS.store(
+                        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64,
+                        Ordering::Relaxed,
+                    );
                     return CallbackResult::Keep;
                 }
 
@@ -571,10 +676,24 @@ mod macos_impl {
                         | CGEventType::OtherMouseDown
                         | CGEventType::OtherMouseUp
                 ) {
+
+                    // CLEAN STATE AFTER MOUSE IDLE
+                    let now = Instant::now();
+                    let idle_and_update = {
+                        let mut last = d.mouse_last_press.lock().unwrap();
+                        let idle = now.duration_since(*last);
+                        if idle > Duration::from_millis(STALE_CLEAR_MS) {
+                            d.pressed_keys.lock().unwrap().clear();
+                            d.pressed_buttons.lock().unwrap().clear();
+                        }
+                        *last = now;
+                        idle
+                    };
+
                     let btn = event.get_integer_value_field(KCG_MOUSE_EVENT_BUTTON_NUMBER);
                     let btn_code = map_macos_mouse_button(btn);
 
-                    if btn_code != "MouseUnknown" {
+                    if btn_code != "MouseUnknown" {  
                         if matches!(
                             etype,
                             CGEventType::LeftMouseDown
@@ -588,16 +707,12 @@ mod macos_impl {
                             pressed.insert(btn_code.to_string());
                             drop(pressed);
 
-                            let now = Instant::now();
-                            let mut last = d.mouse_last_press.lock().unwrap();
-                            let dt = now.duration_since(*last);
-
+                            let dt = idle_and_update;
                             if dt < Duration::from_millis(60) && dt > Duration::from_millis(1) {
                                 println!("⚡ RAPID MOUSE EVENT: '{}' after {}ms", btn_code, dt.as_millis());
                             }
 
                             if dt > Duration::from_millis(1) {
-                                *last = now;
                                 let _ = d.mouse_tx.send(btn_code.to_string());
                             }
                         } else {
@@ -607,6 +722,7 @@ mod macos_impl {
                             let _ = d.mouse_tx.send(format!("UP:{}", btn_code));
                         }
                     }
+                    LAST_EVENT_NS.store(SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64, Ordering::Relaxed);
                     return CallbackResult::Keep;
                 }
 
@@ -615,7 +731,7 @@ mod macos_impl {
             };
 
             let tap = CGEventTap::new(
-                CGEventTapLocation::HID,
+                CGEventTapLocation::Session,
                 CGEventTapPlacement::HeadInsertEventTap,
                 CGEventTapOptions::ListenOnly, // NEW: safer, we only listen
                 events,
@@ -629,6 +745,11 @@ mod macos_impl {
                 let port_ref = port.as_concrete_TypeRef();
                 // store as usize to avoid Send/Sync bounds on raw pointers
                 let _ = TAP_PORT_RAW.set(port_ref as usize);
+                
+                // Enable immediately after creation (in case it is disabled by default by the system)
+                unsafe { CGEventTapEnable(port_ref, true); }
+                // NEW: anti App Nap / energy saving sleep thread tap/audio
+                begin_no_nap_activity();
 
                 let source = CFMachPortCreateRunLoopSource(
                     kCFAllocatorDefault,
@@ -637,6 +758,31 @@ mod macos_impl {
                 );
                 let rl = CFRunLoopGetCurrent();
                 CFRunLoopAddSource(rl, source, kCFRunLoopCommonModes);
+        
+                std::thread::spawn(|| {
+                    loop {
+                        std::thread::sleep(Duration::from_secs(2));
+                        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64;
+                        let last = LAST_EVENT_NS.load(Ordering::Relaxed);
+                        // If no events for 5s, and tap is disabled, re-enable it
+                        if last != 0 && now.saturating_sub(last) > 5_000_000_000 {
+                            if let Some(raw) = TAP_PORT_RAW.get() {
+                                let p = *raw as core_foundation::mach_port::CFMachPortRef;
+                                // Check if tap is enabled
+                                let is_enabled = unsafe { CGEventTapIsEnabled(p) };
+                                if !is_enabled {
+                                    // Throttle: only re-enable once every 10s
+                                    let since_fix = now.saturating_sub(LAST_REPAIR_NS.load(Ordering::Relaxed));
+                                    if since_fix > 10_000_000_000 {
+                                        unsafe { CGEventTapEnable(p, true); }
+                                        LAST_REPAIR_NS.store(now, Ordering::Relaxed);
+                                        println!("🩹 Watchdog re-enabled CGEventTap");
+                                    }
+                                }
+                            }
+                        }
+                    }
+                });
                 println!("✅ CGEventTap installed (check System Settings > Privacy & Security)");
                 CFRunLoopRun();
             }
