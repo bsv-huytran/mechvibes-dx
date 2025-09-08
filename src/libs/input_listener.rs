@@ -517,10 +517,7 @@ mod macos_impl {
                 CGEventType::RightMouseDown,
                 CGEventType::RightMouseUp,
                 CGEventType::OtherMouseDown,
-                CGEventType::OtherMouseUp,
-                // NEW: watch for tap being disabled by system
-                CGEventType::TapDisabledByTimeout,
-                CGEventType::TapDisabledByUserInput,
+                CGEventType::OtherMouseUp
             ];
 
             // FIX: capture an Arc and use it immutably; mutate through Mutex inside fields
